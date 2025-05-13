@@ -44,6 +44,7 @@ import (
 	"tailscale.com/tsd"
 	"tailscale.com/tstest"
 	"tailscale.com/types/dnstype"
+	"tailscale.com/types/ipproto"
 	"tailscale.com/types/key"
 	"tailscale.com/types/logger"
 	"tailscale.com/types/logid"
@@ -60,6 +61,7 @@ import (
 	"tailscale.com/util/syspolicy/source"
 	"tailscale.com/wgengine"
 	"tailscale.com/wgengine/filter"
+	"tailscale.com/wgengine/filter/filtertype"
 	"tailscale.com/wgengine/wgcfg"
 )
 
@@ -434,7 +436,7 @@ func (panicOnUseTransport) RoundTrip(*http.Request) (*http.Response, error) {
 }
 
 func newTestLocalBackend(t testing.TB) *LocalBackend {
-	return newTestLocalBackendWithSys(t, new(tsd.System))
+	return newTestLocalBackendWithSys(t, tsd.NewSystem())
 }
 
 // newTestLocalBackendWithSys creates a new LocalBackend with the given tsd.System.
@@ -446,7 +448,7 @@ func newTestLocalBackendWithSys(t testing.TB, sys *tsd.System) *LocalBackend {
 		sys.Set(new(mem.Store))
 	}
 	if _, ok := sys.Engine.GetOK(); !ok {
-		eng, err := wgengine.NewFakeUserspaceEngine(logf, sys.Set, sys.HealthTracker(), sys.UserMetricsRegistry())
+		eng, err := wgengine.NewFakeUserspaceEngine(logf, sys.Set, sys.HealthTracker(), sys.UserMetricsRegistry(), sys.Bus.Get())
 		if err != nil {
 			t.Fatalf("NewFakeUserspaceEngine: %v", err)
 		}
@@ -571,54 +573,6 @@ func TestSetUseExitNodeEnabled(t *testing.T) {
 	}); err == nil {
 		t.Fatalf("unexpected success; want an error trying to set an internal field")
 	}
-}
-
-func TestFileTargets(t *testing.T) {
-	b := new(LocalBackend)
-	_, err := b.FileTargets()
-	if got, want := fmt.Sprint(err), "not connected to the tailnet"; got != want {
-		t.Errorf("before connect: got %q; want %q", got, want)
-	}
-
-	b.netMap = new(netmap.NetworkMap)
-	_, err = b.FileTargets()
-	if got, want := fmt.Sprint(err), "not connected to the tailnet"; got != want {
-		t.Errorf("non-running netmap: got %q; want %q", got, want)
-	}
-
-	b.state = ipn.Running
-	_, err = b.FileTargets()
-	if got, want := fmt.Sprint(err), "file sharing not enabled by Tailscale admin"; got != want {
-		t.Errorf("without cap: got %q; want %q", got, want)
-	}
-
-	b.capFileSharing = true
-	got, err := b.FileTargets()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(got) != 0 {
-		t.Fatalf("unexpected %d peers", len(got))
-	}
-
-	var peerMap map[tailcfg.NodeID]tailcfg.NodeView
-	mak.NonNil(&peerMap)
-	var nodeID tailcfg.NodeID
-	nodeID = 1234
-	peer := &tailcfg.Node{
-		ID:       1234,
-		Hostinfo: (&tailcfg.Hostinfo{OS: "tvOS"}).View(),
-	}
-	peerMap[nodeID] = peer.View()
-	b.peers = peerMap
-	got, err = b.FileTargets()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(got) != 0 {
-		t.Fatalf("unexpected %d peers", len(got))
-	}
-	// (other cases handled by TestPeerAPIBase above)
 }
 
 func TestInternalAndExternalInterfaces(t *testing.T) {
@@ -966,15 +920,15 @@ func TestWatchNotificationsCallbacks(t *testing.T) {
 // tests LocalBackend.updateNetmapDeltaLocked
 func TestUpdateNetmapDelta(t *testing.T) {
 	b := newTestLocalBackend(t)
-	if b.updateNetmapDeltaLocked(nil) {
+	if b.currentNode().UpdateNetmapDelta(nil) {
 		t.Errorf("updateNetmapDeltaLocked() = true, want false with nil netmap")
 	}
 
-	b.netMap = &netmap.NetworkMap{}
+	nm := &netmap.NetworkMap{}
 	for i := range 5 {
-		b.netMap.Peers = append(b.netMap.Peers, (&tailcfg.Node{ID: (tailcfg.NodeID(i) + 1)}).View())
+		nm.Peers = append(nm.Peers, (&tailcfg.Node{ID: (tailcfg.NodeID(i) + 1)}).View())
 	}
-	b.updatePeersFromNetmapLocked(b.netMap)
+	b.currentNode().SetNetMap(nm)
 
 	someTime := time.Unix(123, 0)
 	muts, ok := netmap.MutationsFromMapResponse(&tailcfg.MapResponse{
@@ -1001,7 +955,7 @@ func TestUpdateNetmapDelta(t *testing.T) {
 		t.Fatal("netmap.MutationsFromMapResponse failed")
 	}
 
-	if !b.updateNetmapDeltaLocked(muts) {
+	if !b.currentNode().UpdateNetmapDelta(muts) {
 		t.Fatalf("updateNetmapDeltaLocked() = false, want true with new netmap")
 	}
 
@@ -1024,9 +978,9 @@ func TestUpdateNetmapDelta(t *testing.T) {
 		},
 	}
 	for _, want := range wants {
-		gotv, ok := b.peers[want.ID]
+		gotv, ok := b.currentNode().PeerByID(want.ID)
 		if !ok {
-			t.Errorf("netmap.Peer %v missing from b.peers", want.ID)
+			t.Errorf("netmap.Peer %v missing from b.profile.Peers", want.ID)
 			continue
 		}
 		got := gotv.AsStruct()
@@ -1444,7 +1398,7 @@ func TestCoveredRouteRangeNoDefault(t *testing.T) {
 
 func TestReconfigureAppConnector(t *testing.T) {
 	b := newTestBackend(t)
-	b.reconfigAppConnectorLocked(b.netMap, b.pm.prefs)
+	b.reconfigAppConnectorLocked(b.NetMap(), b.pm.prefs)
 	if b.appConnector != nil {
 		t.Fatal("unexpected app connector")
 	}
@@ -1457,7 +1411,7 @@ func TestReconfigureAppConnector(t *testing.T) {
 		},
 		AppConnectorSet: true,
 	})
-	b.reconfigAppConnectorLocked(b.netMap, b.pm.prefs)
+	b.reconfigAppConnectorLocked(b.NetMap(), b.pm.prefs)
 	if b.appConnector == nil {
 		t.Fatal("expected app connector")
 	}
@@ -1468,15 +1422,19 @@ func TestReconfigureAppConnector(t *testing.T) {
 		"connectors": ["tag:example"]
 	}`
 
-	b.netMap.SelfNode = (&tailcfg.Node{
-		Name: "example.ts.net",
-		Tags: []string{"tag:example"},
-		CapMap: (tailcfg.NodeCapMap)(map[tailcfg.NodeCapability][]tailcfg.RawMessage{
-			"tailscale.com/app-connectors": {tailcfg.RawMessage(appCfg)},
-		}),
-	}).View()
+	nm := &netmap.NetworkMap{
+		SelfNode: (&tailcfg.Node{
+			Name: "example.ts.net",
+			Tags: []string{"tag:example"},
+			CapMap: (tailcfg.NodeCapMap)(map[tailcfg.NodeCapability][]tailcfg.RawMessage{
+				"tailscale.com/app-connectors": {tailcfg.RawMessage(appCfg)},
+			}),
+		}).View(),
+	}
 
-	b.reconfigAppConnectorLocked(b.netMap, b.pm.prefs)
+	b.currentNode().SetNetMap(nm)
+
+	b.reconfigAppConnectorLocked(b.NetMap(), b.pm.prefs)
 	b.appConnector.Wait(context.Background())
 
 	want := []string{"example.com"}
@@ -1496,7 +1454,7 @@ func TestReconfigureAppConnector(t *testing.T) {
 		},
 		AppConnectorSet: true,
 	})
-	b.reconfigAppConnectorLocked(b.netMap, b.pm.prefs)
+	b.reconfigAppConnectorLocked(b.NetMap(), b.pm.prefs)
 	if b.appConnector != nil {
 		t.Fatal("expected no app connector")
 	}
@@ -1508,6 +1466,15 @@ func TestReconfigureAppConnector(t *testing.T) {
 func TestBackfillAppConnectorRoutes(t *testing.T) {
 	// Create backend with an empty app connector.
 	b := newTestBackend(t)
+	// newTestBackend creates a backend with a non-nil netmap,
+	// but this test requires a nil netmap.
+	// Otherwise, instead of backfilling, [LocalBackend.reconfigAppConnectorLocked]
+	// uses the domains and routes from netmap's [appctype.AppConnectorAttr].
+	// Additionally, a non-nil netmap makes reconfigAppConnectorLocked
+	// asynchronous, resulting in a flaky test.
+	// Therefore, we set the netmap to nil to simulate a fresh backend start
+	// or a profile switch where the netmap is not yet available.
+	b.setNetMapLocked(nil)
 	if err := b.Start(ipn.Options{}); err != nil {
 		t.Fatal(err)
 	}
@@ -1519,7 +1486,7 @@ func TestBackfillAppConnectorRoutes(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	b.reconfigAppConnectorLocked(b.netMap, b.pm.prefs)
+	b.reconfigAppConnectorLocked(b.NetMap(), b.pm.prefs)
 
 	// Smoke check that AdvertiseRoutes doesn't have the test IP.
 	ip := netip.MustParseAddr("1.2.3.4")
@@ -1540,7 +1507,7 @@ func TestBackfillAppConnectorRoutes(t *testing.T) {
 
 	// Mimic b.authReconfigure for the app connector bits.
 	b.mu.Lock()
-	b.reconfigAppConnectorLocked(b.netMap, b.pm.prefs)
+	b.reconfigAppConnectorLocked(b.NetMap(), b.pm.prefs)
 	b.mu.Unlock()
 	b.readvertiseAppConnectorRoutes()
 
@@ -1856,7 +1823,7 @@ func TestSetExitNodeIDPolicy(t *testing.T) {
 			}
 			pm := must.Get(newProfileManager(new(mem.Store), t.Logf, new(health.Tracker)))
 			pm.prefs = test.prefs.View()
-			b.netMap = test.nm
+			b.currentNode().SetNetMap(test.nm)
 			b.pm = pm
 			b.lastSuggestedExitNode = test.lastSuggestedExitNode
 
@@ -1983,8 +1950,7 @@ func TestUpdateNetmapDeltaAutoExitNode(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			b := newTestLocalBackend(t)
-			b.netMap = tt.netmap
-			b.updatePeersFromNetmapLocked(b.netMap)
+			b.currentNode().SetNetMap(tt.netmap)
 			b.lastSuggestedExitNode = tt.lastSuggestedExitNode
 			b.sys.MagicSock.Get().SetLastNetcheckReportForTest(b.ctx, tt.report)
 			b.SetPrefsForTest(b.pm.CurrentPrefs().AsStruct())
@@ -2102,14 +2068,14 @@ func TestAutoExitNodeSetNetInfoCallback(t *testing.T) {
 			},
 		},
 	}
-	b.netMap = &netmap.NetworkMap{
+	b.currentNode().SetNetMap(&netmap.NetworkMap{
 		SelfNode: selfNode.View(),
 		Peers: []tailcfg.NodeView{
 			peer1,
 			peer2,
 		},
 		DERPMap: defaultDERPMap,
-	}
+	})
 	b.lastSuggestedExitNode = peer1.StableID()
 	b.SetPrefsForTest(b.pm.CurrentPrefs().AsStruct())
 	if eid := b.Prefs().ExitNodeID(); eid != peer1.StableID() {
@@ -2174,7 +2140,7 @@ func TestSetControlClientStatusAutoExitNode(t *testing.T) {
 		syspolicy.ExitNodeID, "auto:any",
 	))
 	syspolicy.MustRegisterStoreForTest(t, "TestStore", setting.DeviceScope, policyStore)
-	b.netMap = nm
+	b.currentNode().SetNetMap(nm)
 	b.lastSuggestedExitNode = peer1.StableID()
 	b.sys.MagicSock.Get().SetLastNetcheckReportForTest(b.ctx, report)
 	b.SetPrefsForTest(b.pm.CurrentPrefs().AsStruct())
@@ -2654,7 +2620,7 @@ func TestOnTailnetDefaultAutoUpdate(t *testing.T) {
 			// On platforms that don't support auto-update we can never
 			// transition to auto-updates being enabled. The value should
 			// remain unchanged after onTailnetDefaultAutoUpdate.
-			if !clientupdate.CanAutoUpdate() && want.EqualBool(true) {
+			if !clientupdate.CanAutoUpdate() {
 				want = tt.before
 			}
 			if got := b.pm.CurrentPrefs().AutoUpdate().Apply; got != want {
@@ -3105,9 +3071,11 @@ func TestDriveManageShares(t *testing.T) {
 				b.driveSetSharesLocked(tt.existing)
 			}
 			if !tt.disabled {
-				self := b.netMap.SelfNode.AsStruct()
+				nm := ptr.To(*b.currentNode().NetMap())
+				self := nm.SelfNode.AsStruct()
 				self.CapMap = tailcfg.NodeCapMap{tailcfg.NodeAttrsTaildriveShare: nil}
-				b.netMap.SelfNode = self.View()
+				nm.SelfNode = self.View()
+				b.currentNode().SetNetMap(nm)
 				b.sys.Set(driveimpl.NewFileSystemForRemote(b.logf))
 			}
 			b.mu.Unlock()
@@ -4113,7 +4081,7 @@ func TestReadWriteRouteInfo(t *testing.T) {
 	}
 
 	// write the other routeInfo as the other profile
-	if err := b.pm.SwitchProfile("id2"); err != nil {
+	if _, _, err := b.pm.SwitchToProfileByID("id2"); err != nil {
 		t.Fatal(err)
 	}
 	if err := b.storeRouteInfo(ri2); err != nil {
@@ -4121,7 +4089,7 @@ func TestReadWriteRouteInfo(t *testing.T) {
 	}
 
 	// read the routeInfo of the first profile
-	if err := b.pm.SwitchProfile("id1"); err != nil {
+	if _, _, err := b.pm.SwitchToProfileByID("id1"); err != nil {
 		t.Fatal(err)
 	}
 	readRi, err = b.readRouteInfoLocked()
@@ -4133,7 +4101,7 @@ func TestReadWriteRouteInfo(t *testing.T) {
 	}
 
 	// read the routeInfo of the second profile
-	if err := b.pm.SwitchProfile("id2"); err != nil {
+	if _, _, err := b.pm.SwitchToProfileByID("id2"); err != nil {
 		t.Fatal(err)
 	}
 	readRi, err = b.readRouteInfoLocked()
@@ -4396,19 +4364,27 @@ func TestNotificationTargetMatch(t *testing.T) {
 type newTestControlFn func(tb testing.TB, opts controlclient.Options) controlclient.Client
 
 func newLocalBackendWithTestControl(t *testing.T, enableLogging bool, newControl newTestControlFn) *LocalBackend {
+	return newLocalBackendWithSysAndTestControl(t, enableLogging, tsd.NewSystem(), newControl)
+}
+
+func newLocalBackendWithSysAndTestControl(t *testing.T, enableLogging bool, sys *tsd.System, newControl newTestControlFn) *LocalBackend {
 	logf := logger.Discard
 	if enableLogging {
 		logf = tstest.WhileTestRunningLogger(t)
 	}
-	sys := new(tsd.System)
-	store := new(mem.Store)
-	sys.Set(store)
-	e, err := wgengine.NewFakeUserspaceEngine(logf, sys.Set, sys.HealthTracker(), sys.UserMetricsRegistry())
-	if err != nil {
-		t.Fatalf("NewFakeUserspaceEngine: %v", err)
+
+	if _, hasStore := sys.StateStore.GetOK(); !hasStore {
+		store := new(mem.Store)
+		sys.Set(store)
 	}
-	t.Cleanup(e.Close)
-	sys.Set(e)
+	if _, hasEngine := sys.Engine.GetOK(); !hasEngine {
+		e, err := wgengine.NewFakeUserspaceEngine(logf, sys.Set, sys.HealthTracker(), sys.UserMetricsRegistry(), sys.Bus.Get())
+		if err != nil {
+			t.Fatalf("NewFakeUserspaceEngine: %v", err)
+		}
+		t.Cleanup(e.Close)
+		sys.Set(e)
+	}
 
 	b, err := NewLocalBackend(logf, logid.PublicID{}, sys, 0)
 	if err != nil {
@@ -4743,32 +4719,132 @@ func TestLoginNotifications(t *testing.T) {
 // TestConfigFileReload tests that the LocalBackend reloads its configuration
 // when the configuration file changes.
 func TestConfigFileReload(t *testing.T) {
-	cfg1 := `{"Hostname": "foo", "Version": "alpha0"}`
-	f := filepath.Join(t.TempDir(), "cfg")
-	must.Do(os.WriteFile(f, []byte(cfg1), 0600))
-	sys := new(tsd.System)
-	sys.InitialConfig = must.Get(conffile.Load(f))
-	lb := newTestLocalBackendWithSys(t, sys)
-	must.Do(lb.Start(ipn.Options{}))
-
-	lb.mu.Lock()
-	hn := lb.hostinfo.Hostname
-	lb.mu.Unlock()
-	if hn != "foo" {
-		t.Fatalf("got %q; want %q", hn, "foo")
+	type testCase struct {
+		name    string
+		initial *conffile.Config
+		updated *conffile.Config
+		checkFn func(*testing.T, *LocalBackend)
 	}
 
-	cfg2 := `{"Hostname": "bar", "Version": "alpha0"}`
-	must.Do(os.WriteFile(f, []byte(cfg2), 0600))
-	if !must.Get(lb.ReloadConfig()) {
-		t.Fatal("reload failed")
+	tests := []testCase{
+		{
+			name: "hostname_change",
+			initial: &conffile.Config{
+				Parsed: ipn.ConfigVAlpha{
+					Version:  "alpha0",
+					Hostname: ptr.To("initial-host"),
+				},
+			},
+			updated: &conffile.Config{
+				Parsed: ipn.ConfigVAlpha{
+					Version:  "alpha0",
+					Hostname: ptr.To("updated-host"),
+				},
+			},
+			checkFn: func(t *testing.T, b *LocalBackend) {
+				if got := b.Prefs().Hostname(); got != "updated-host" {
+					t.Errorf("hostname = %q; want updated-host", got)
+				}
+			},
+		},
+		{
+			name: "start_advertising_services",
+			initial: &conffile.Config{
+				Parsed: ipn.ConfigVAlpha{
+					Version: "alpha0",
+				},
+			},
+			updated: &conffile.Config{
+				Parsed: ipn.ConfigVAlpha{
+					Version:           "alpha0",
+					AdvertiseServices: []string{"svc:abc", "svc:def"},
+				},
+			},
+			checkFn: func(t *testing.T, b *LocalBackend) {
+				if got := b.Prefs().AdvertiseServices().AsSlice(); !reflect.DeepEqual(got, []string{"svc:abc", "svc:def"}) {
+					t.Errorf("AdvertiseServices = %v; want [svc:abc, svc:def]", got)
+				}
+			},
+		},
+		{
+			name: "change_advertised_services",
+			initial: &conffile.Config{
+				Parsed: ipn.ConfigVAlpha{
+					Version:           "alpha0",
+					AdvertiseServices: []string{"svc:abc", "svc:def"},
+				},
+			},
+			updated: &conffile.Config{
+				Parsed: ipn.ConfigVAlpha{
+					Version:           "alpha0",
+					AdvertiseServices: []string{"svc:abc", "svc:ghi"},
+				},
+			},
+			checkFn: func(t *testing.T, b *LocalBackend) {
+				if got := b.Prefs().AdvertiseServices().AsSlice(); !reflect.DeepEqual(got, []string{"svc:abc", "svc:ghi"}) {
+					t.Errorf("AdvertiseServices = %v; want [svc:abc, svc:ghi]", got)
+				}
+			},
+		},
+		{
+			name: "unset_advertised_services",
+			initial: &conffile.Config{
+				Parsed: ipn.ConfigVAlpha{
+					Version:           "alpha0",
+					AdvertiseServices: []string{"svc:abc"},
+				},
+			},
+			updated: &conffile.Config{
+				Parsed: ipn.ConfigVAlpha{
+					Version: "alpha0",
+				},
+			},
+			checkFn: func(t *testing.T, b *LocalBackend) {
+				if b.Prefs().AdvertiseServices().Len() != 0 {
+					t.Errorf("got %d AdvertiseServices wants none", b.Prefs().AdvertiseServices().Len())
+				}
+			},
+		},
 	}
 
-	lb.mu.Lock()
-	hn = lb.hostinfo.Hostname
-	lb.mu.Unlock()
-	if hn != "bar" {
-		t.Fatalf("got %q; want %q", hn, "bar")
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			path := filepath.Join(dir, "tailscale.conf")
+
+			// Write initial config
+			initialJSON, err := json.Marshal(tc.initial.Parsed)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(path, initialJSON, 0644); err != nil {
+				t.Fatal(err)
+			}
+
+			// Create backend with initial config
+			tc.initial.Path = path
+			tc.initial.Raw = initialJSON
+			sys := tsd.NewSystem()
+			sys.InitialConfig = tc.initial
+			b := newTestLocalBackendWithSys(t, sys)
+
+			// Update config file
+			updatedJSON, err := json.Marshal(tc.updated.Parsed)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(path, updatedJSON, 0644); err != nil {
+				t.Fatal(err)
+			}
+
+			// Trigger reload
+			if ok, err := b.ReloadConfig(); !ok || err != nil {
+				t.Fatalf("ReloadConfig() = %v, %v; want true, nil", ok, err)
+			}
+
+			// Check outcome
+			tc.checkFn(t, b)
+		})
 	}
 }
 
@@ -5084,7 +5160,7 @@ func TestUpdateIngressLocked(t *testing.T) {
 				},
 			},
 			wantIngress:       true,
-			wantWireIngress:   true,
+			wantWireIngress:   false, // implied by wantIngress
 			wantControlUpdate: true,
 		},
 		{
@@ -5111,7 +5187,6 @@ func TestUpdateIngressLocked(t *testing.T) {
 			name: "funnel_enabled_no_change",
 			hi: &tailcfg.Hostinfo{
 				IngressEnabled: true,
-				WireIngress:    true,
 			},
 			sc: &ipn.ServeConfig{
 				AllowFunnel: map[ipn.HostPort]bool{
@@ -5119,7 +5194,7 @@ func TestUpdateIngressLocked(t *testing.T) {
 				},
 			},
 			wantIngress:     true,
-			wantWireIngress: true,
+			wantWireIngress: false, // implied by wantIngress
 		},
 		{
 			name: "funnel_disabled_no_change",
@@ -5137,7 +5212,6 @@ func TestUpdateIngressLocked(t *testing.T) {
 			name: "funnel_changes_to_disabled",
 			hi: &tailcfg.Hostinfo{
 				IngressEnabled: true,
-				WireIngress:    true,
 			},
 			sc: &ipn.ServeConfig{
 				AllowFunnel: map[ipn.HostPort]bool{
@@ -5157,8 +5231,8 @@ func TestUpdateIngressLocked(t *testing.T) {
 					"tailnet.xyz:443": true,
 				},
 			},
-			wantWireIngress:   true,
 			wantIngress:       true,
+			wantWireIngress:   false, // implied by wantIngress
 			wantControlUpdate: true,
 		},
 	}
@@ -5206,5 +5280,62 @@ func TestUpdateIngressLocked(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestSrcCapPacketFilter tests that LocalBackend handles packet filters with
+// SrcCaps instead of Srcs (IPs)
+func TestSrcCapPacketFilter(t *testing.T) {
+	lb := newLocalBackendWithTestControl(t, false, func(tb testing.TB, opts controlclient.Options) controlclient.Client {
+		return newClient(tb, opts)
+	})
+	if err := lb.Start(ipn.Options{}); err != nil {
+		t.Fatalf("(*LocalBackend).Start(): %v", err)
+	}
+
+	var k key.NodePublic
+	must.Do(k.UnmarshalText([]byte("nodekey:5c8f86d5fc70d924e55f02446165a5dae8f822994ad26bcf4b08fd841f9bf261")))
+
+	controlClient := lb.cc.(*mockControl)
+	controlClient.send(nil, "", false, &netmap.NetworkMap{
+		SelfNode: (&tailcfg.Node{
+			Addresses: []netip.Prefix{netip.MustParsePrefix("1.1.1.1/32")},
+		}).View(),
+		Peers: []tailcfg.NodeView{
+			(&tailcfg.Node{
+				Addresses: []netip.Prefix{netip.MustParsePrefix("2.2.2.2/32")},
+				ID:        2,
+				Key:       k,
+				CapMap:    tailcfg.NodeCapMap{"cap-X": nil}, // node 2 has cap
+			}).View(),
+			(&tailcfg.Node{
+				Addresses: []netip.Prefix{netip.MustParsePrefix("3.3.3.3/32")},
+				ID:        3,
+				Key:       k,
+				CapMap:    tailcfg.NodeCapMap{}, // node 3 does not have the cap
+			}).View(),
+		},
+		PacketFilter: []filtertype.Match{{
+			IPProto: views.SliceOf([]ipproto.Proto{ipproto.TCP}),
+			SrcCaps: []tailcfg.NodeCapability{"cap-X"}, // cap in packet filter rule
+			Dsts: []filtertype.NetPortRange{{
+				Net: netip.MustParsePrefix("1.1.1.1/32"),
+				Ports: filtertype.PortRange{
+					First: 22,
+					Last:  22,
+				},
+			}},
+		}},
+	})
+
+	f := lb.GetFilterForTest()
+	res := f.Check(netip.MustParseAddr("2.2.2.2"), netip.MustParseAddr("1.1.1.1"), 22, ipproto.TCP)
+	if res != filter.Accept {
+		t.Errorf("Check(2.2.2.2, ...) = %s, want %s", res, filter.Accept)
+	}
+
+	res = f.Check(netip.MustParseAddr("3.3.3.3"), netip.MustParseAddr("1.1.1.1"), 22, ipproto.TCP)
+	if !res.IsDrop() {
+		t.Error("IsDrop() for node without cap = false, want true")
 	}
 }

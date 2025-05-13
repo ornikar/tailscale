@@ -95,6 +95,7 @@ type endpoint struct {
 
 	expired         bool // whether the node has expired
 	isWireguardOnly bool // whether the endpoint is WireGuard only
+	relayCapable    bool // whether the node is capable of speaking via a [tailscale.com/net/udprelay.Server]
 }
 
 func (de *endpoint) setBestAddrLocked(v addrQuality) {
@@ -948,7 +949,15 @@ func (de *endpoint) send(buffs [][]byte) error {
 	de.mu.Unlock()
 
 	if !udpAddr.IsValid() && !derpAddr.IsValid() {
-		return errNoUDPOrDERP
+		// Make a last ditch effort to see if we have a DERP route for them. If
+		// they contacted us over DERP and we don't know their UDP endpoints or
+		// their DERP home, we can at least assume they're reachable over the
+		// DERP they used to contact us.
+		if rid := de.c.fallbackDERPRegionForPeer(de.publicKey); rid != 0 {
+			derpAddr = netip.AddrPortFrom(tailcfg.DerpMagicIPAddr, uint16(rid))
+		} else {
+			return errNoUDPOrDERP
+		}
 	}
 	var err error
 	if udpAddr.IsValid() {
@@ -1103,7 +1112,7 @@ func (de *endpoint) sendDiscoPing(ep netip.AddrPort, discoKey key.DiscoPublic, t
 	size = min(size, MaxDiscoPingSize)
 	padding := max(size-discoPingSize, 0)
 
-	sent, _ := de.c.sendDiscoMessage(ep, de.publicKey, discoKey, &disco.Ping{
+	sent, _ := de.c.sendDiscoMessage(ep, nil, de.publicKey, discoKey, &disco.Ping{
 		TxID:    [12]byte(txid),
 		NodeKey: de.c.publicKeyAtomic.Load(),
 		Padding: padding,
@@ -1241,6 +1250,13 @@ func (de *endpoint) sendDiscoPingsLocked(now mono.Time, sendCallMeMaybe bool) {
 		// sent so our firewall ports are probably open and now
 		// would be a good time for them to connect.
 		go de.c.enqueueCallMeMaybe(derpAddr, de)
+
+		// Schedule allocation of relay endpoints. We make no considerations for
+		// current relay endpoints or best UDP path state for now, keep it
+		// simple.
+		if de.relayCapable {
+			go de.c.relayManager.allocateAndHandshakeAllServers(de)
+		}
 	}
 }
 
@@ -1855,6 +1871,7 @@ func (de *endpoint) resetLocked() {
 		}
 	}
 	de.probeUDPLifetime.resetCycleEndpointLocked()
+	de.c.relayManager.cancelOutstandingWork(de)
 }
 
 func (de *endpoint) numStopAndReset() int64 {

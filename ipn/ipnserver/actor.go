@@ -81,6 +81,7 @@ func actorWithAccessOverride(baseActor *actor, reason string) *actor {
 		logf:                 baseActor.logf,
 		ci:                   baseActor.ci,
 		clientID:             baseActor.clientID,
+		userID:               baseActor.userID,
 		accessOverrideReason: reason,
 		isLocalSystem:        baseActor.isLocalSystem,
 	}
@@ -176,6 +177,12 @@ var actorKey = ctxkey.New("ipnserver.actor", actorOrError{err: errNoActor})
 func contextWithActor(ctx context.Context, logf logger.Logf, c net.Conn) context.Context {
 	actor, err := newActor(logf, c)
 	return actorKey.WithValue(ctx, actorOrError{actor: actor, err: err})
+}
+
+// NewContextWithActorForTest returns a new context that carries the identity
+// of the specified actor. It is used in tests only.
+func NewContextWithActorForTest(ctx context.Context, actor ipnauth.Actor) context.Context {
+	return actorKey.WithValue(ctx, actorOrError{actor: actor})
 }
 
 // actorFromContext returns an [ipnauth.Actor] associated with ctx,

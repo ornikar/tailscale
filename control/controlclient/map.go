@@ -19,6 +19,7 @@ import (
 
 	"tailscale.com/control/controlknobs"
 	"tailscale.com/envknob"
+	"tailscale.com/hostinfo"
 	"tailscale.com/tailcfg"
 	"tailscale.com/tstime"
 	"tailscale.com/types/key"
@@ -89,7 +90,6 @@ type mapSession struct {
 	lastPopBrowserURL      string
 	lastTKAInfo            *tailcfg.TKAInfo
 	lastNetmapSummary      string // from NetworkMap.VeryConcise
-	lastMaxExpiry          time.Duration
 }
 
 // newMapSession returns a mostly unconfigured new mapSession.
@@ -241,6 +241,9 @@ func upgradeNode(n *tailcfg.Node) {
 		}
 		n.LegacyDERPString = ""
 	}
+	if DevKnob.StripHomeDERP() {
+		n.HomeDERP = 0
+	}
 
 	if n.AllowedIPs == nil {
 		n.AllowedIPs = slices.Clone(n.Addresses)
@@ -303,6 +306,31 @@ func (ms *mapSession) updateStateFromResponse(resp *tailcfg.MapResponse) {
 		for rid, r := range dm.Regions {
 			if r == nil {
 				delete(dm.Regions, rid)
+			}
+		}
+
+		// In the copy/v86 wasm environment with limited networking, if the
+		// control plane didn't pick our DERP home for us, do it ourselves and
+		// mark all but the lowest region as NoMeasureNoHome. For prod, this
+		// will be Region 1, NYC, a compromise between the US and Europe. But
+		// really the control plane should pick this. This is only a fallback.
+		if hostinfo.IsInVM86() {
+			numCanMeasure := 0
+			lowest := 0
+			for rid, r := range dm.Regions {
+				if !r.NoMeasureNoHome {
+					numCanMeasure++
+					if lowest == 0 || rid < lowest {
+						lowest = rid
+					}
+				}
+			}
+			if numCanMeasure > 1 {
+				for rid, r := range dm.Regions {
+					if rid != lowest {
+						r.NoMeasureNoHome = true
+					}
+				}
 			}
 		}
 
@@ -383,9 +411,6 @@ func (ms *mapSession) updateStateFromResponse(resp *tailcfg.MapResponse) {
 	}
 	if resp.TKAInfo != nil {
 		ms.lastTKAInfo = resp.TKAInfo
-	}
-	if resp.MaxKeyDuration > 0 {
-		ms.lastMaxExpiry = resp.MaxKeyDuration
 	}
 }
 
@@ -819,7 +844,6 @@ func (ms *mapSession) netmap() *netmap.NetworkMap {
 		DERPMap:           ms.lastDERPMap,
 		ControlHealth:     ms.lastHealth,
 		TKAEnabled:        ms.lastTKAInfo != nil && !ms.lastTKAInfo.Disabled,
-		MaxKeyDuration:    ms.lastMaxExpiry,
 	}
 
 	if ms.lastTKAInfo != nil && ms.lastTKAInfo.Head != "" {

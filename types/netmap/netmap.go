@@ -79,9 +79,6 @@ type NetworkMap struct {
 	// UserProfiles contains the profile information of UserIDs referenced
 	// in SelfNode and Peers.
 	UserProfiles map[tailcfg.UserID]tailcfg.UserProfileView
-
-	// MaxKeyDuration describes the MaxKeyDuration setting for the tailnet.
-	MaxKeyDuration time.Duration
 }
 
 // User returns nm.SelfNode.User if nm.SelfNode is non-nil, otherwise it returns
@@ -149,6 +146,14 @@ func (nm *NetworkMap) GetIPVIPServiceMap() IPServiceMappings {
 		}
 	}
 	return res
+}
+
+// SelfNodeOrZero returns the self node, or a zero value if nm is nil.
+func (nm *NetworkMap) SelfNodeOrZero() tailcfg.NodeView {
+	if nm == nil {
+		return tailcfg.NodeView{}
+	}
+	return nm.SelfNode
 }
 
 // AnyPeersAdvertiseRoutes reports whether any peer is advertising non-exit node routes.

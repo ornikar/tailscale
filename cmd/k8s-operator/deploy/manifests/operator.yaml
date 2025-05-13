@@ -61,6 +61,9 @@ spec:
               jsonPath: .status.conditions[?(@.type == "ConnectorReady")].reason
               name: Status
               type: string
+            - jsonPath: .metadata.creationTimestamp
+              name: Age
+              type: date
           name: v1alpha1
           schema:
             openAPIV3Schema:
@@ -312,6 +315,9 @@ spec:
               jsonPath: .status.nameserver.ip
               name: NameserverIP
               type: string
+            - jsonPath: .metadata.creationTimestamp
+              name: Age
+              type: date
           name: v1alpha1
           schema:
             openAPIV3Schema:
@@ -492,6 +498,9 @@ spec:
               jsonPath: .status.conditions[?(@.type == "ProxyClassReady")].reason
               name: Status
               type: string
+            - jsonPath: .metadata.creationTimestamp
+              name: Age
+              type: date
           name: v1alpha1
           schema:
             openAPIV3Schema:
@@ -2685,6 +2694,22 @@ spec:
                                             Defaults to false.
                                         type: boolean
                                 type: object
+                            useLetsEncryptStagingEnvironment:
+                                description: |-
+                                    Set UseLetsEncryptStagingEnvironment to true to issue TLS
+                                    certificates for any HTTPS endpoints exposed to the tailnet from
+                                    LetsEncrypt's staging environment.
+                                    https://letsencrypt.org/docs/staging-environment/
+                                    This setting only affects Tailscale Ingress resources.
+                                    By default Ingress TLS certificates are issued from LetsEncrypt's
+                                    production environment.
+                                    Changing this setting true -> false, will result in any
+                                    existing certs being re-issued from the production environment.
+                                    Changing this setting false (default) -> true, when certs have already
+                                    been provisioned from production environment will NOT result in certs
+                                    being re-issued from the staging environment before they need to be
+                                    renewed.
+                                type: boolean
                         type: object
                     status:
                         description: |-
@@ -2787,6 +2812,9 @@ spec:
               jsonPath: .spec.type
               name: Type
               type: string
+            - jsonPath: .metadata.creationTimestamp
+              name: Age
+              type: date
           name: v1alpha1
           schema:
             openAPIV3Schema:
@@ -2997,6 +3025,9 @@ spec:
               jsonPath: .status.devices[?(@.url != "")].url
               name: URL
               type: string
+            - jsonPath: .metadata.creationTimestamp
+              name: Age
+              type: date
           name: v1alpha1
           schema:
             openAPIV3Schema:
@@ -4898,6 +4929,7 @@ rules:
         - update
         - list
         - watch
+        - deletecollection
     - apiGroups:
         - monitoring.coreos.com
       resources:

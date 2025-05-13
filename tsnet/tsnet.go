@@ -30,7 +30,6 @@ import (
 	"tailscale.com/client/tailscale"
 	"tailscale.com/control/controlclient"
 	"tailscale.com/envknob"
-	_ "tailscale.com/feature/condregister"
 	"tailscale.com/health"
 	"tailscale.com/hostinfo"
 	"tailscale.com/ipn"
@@ -49,6 +48,7 @@ import (
 	"tailscale.com/net/socks5"
 	"tailscale.com/net/tsdial"
 	"tailscale.com/tsd"
+	"tailscale.com/types/bools"
 	"tailscale.com/types/logger"
 	"tailscale.com/types/logid"
 	"tailscale.com/types/nettype"
@@ -434,8 +434,11 @@ func (s *Server) Close() error {
 	for _, ln := range s.listeners {
 		ln.closeLocked()
 	}
-
 	wg.Wait()
+
+	if bus := s.sys.Bus.Get(); bus != nil {
+		bus.Close()
+	}
 	s.closed = true
 	return nil
 }
@@ -504,6 +507,11 @@ func (s *Server) start() (reterr error) {
 			// directory and hostname when they're not supplied. But we can fall
 			// back to "tsnet" as well.
 			exe = "tsnet"
+		case "ios":
+			// When compiled as a framework (via TailscaleKit in libtailscale),
+			// os.Executable() returns an error, so fall back to "tsnet" there
+			// too.
+			exe = "tsnet"
 		default:
 			return err
 		}
@@ -552,13 +560,13 @@ func (s *Server) start() (reterr error) {
 		s.Logf(format, a...)
 	}
 
-	sys := new(tsd.System)
+	sys := tsd.NewSystem()
 	s.sys = sys
 	if err := s.startLogger(&closePool, sys.HealthTracker(), tsLogf); err != nil {
 		return err
 	}
 
-	s.netMon, err = netmon.New(tsLogf)
+	s.netMon, err = netmon.New(sys.Bus.Get(), tsLogf)
 	if err != nil {
 		return err
 	}
@@ -566,6 +574,7 @@ func (s *Server) start() (reterr error) {
 
 	s.dialer = &tsdial.Dialer{Logf: tsLogf} // mutated below (before used)
 	eng, err := wgengine.NewUserspaceEngine(tsLogf, wgengine.Config{
+		EventBus:      sys.Bus.Get(),
 		ListenPort:    s.Port,
 		NetMon:        s.netMon,
 		Dialer:        s.dialer,
@@ -601,7 +610,9 @@ func (s *Server) start() (reterr error) {
 		// Note: don't just return ns.DialContextTCP or we'll return
 		// *gonet.TCPConn(nil) instead of a nil interface which trips up
 		// callers.
-		tcpConn, err := ns.DialContextTCP(ctx, dst)
+		v4, v6 := s.TailscaleIPs()
+		src := bools.IfElse(dst.Addr().Is6(), v6, v4)
+		tcpConn, err := ns.DialContextTCPWithBind(ctx, src, dst)
 		if err != nil {
 			return nil, err
 		}
@@ -611,7 +622,9 @@ func (s *Server) start() (reterr error) {
 		// Note: don't just return ns.DialContextUDP or we'll return
 		// *gonet.UDPConn(nil) instead of a nil interface which trips up
 		// callers.
-		udpConn, err := ns.DialContextUDP(ctx, dst)
+		v4, v6 := s.TailscaleIPs()
+		src := bools.IfElse(dst.Addr().Is6(), v6, v4)
+		udpConn, err := ns.DialContextUDPWithBind(ctx, src, dst)
 		if err != nil {
 			return nil, err
 		}
@@ -930,6 +943,8 @@ func getTSNetDir(logf logger.Logf, confDir, prog string) (string, error) {
 // APIClient returns a tailscale.Client that can be used to make authenticated
 // requests to the Tailscale control server.
 // It requires the user to set tailscale.I_Acknowledge_This_API_Is_Unstable.
+//
+// Deprecated: use AuthenticatedAPITransport with tailscale.com/client/tailscale/v2 instead.
 func (s *Server) APIClient() (*tailscale.Client, error) {
 	if !tailscale.I_Acknowledge_This_API_Is_Unstable {
 		return nil, errors.New("use of Client without setting I_Acknowledge_This_API_Is_Unstable")
@@ -942,6 +957,41 @@ func (s *Server) APIClient() (*tailscale.Client, error) {
 	c.UserAgent = "tailscale-tsnet"
 	c.HTTPClient = &http.Client{Transport: s.lb.KeyProvingNoiseRoundTripper()}
 	return c, nil
+}
+
+// I_Acknowledge_This_API_Is_Experimental must be set true to use AuthenticatedAPITransport()
+// for now.
+var I_Acknowledge_This_API_Is_Experimental = false
+
+// AuthenticatedAPITransport provides an HTTP transport that can be used with
+// the control server API without needing additional authentication details. It
+// authenticates using the current client's nodekey.
+//
+// It requires the user to set I_Acknowledge_This_API_Is_Experimental.
+//
+// For example:
+//
+//	import "net/http"
+//	import "tailscale.com/client/tailscale/v2"
+//	import "tailscale.com/tsnet"
+//
+//	var s *tsnet.Server
+//	...
+//	rt, err := s.AuthenticatedAPITransport()
+//	// handler err ...
+//	var client tailscale.Client{HTTP: http.Client{
+//	    Timeout: 1*time.Minute,
+//	    UserAgent: "your-useragent-here",
+//	    Transport: rt,
+//	}}
+func (s *Server) AuthenticatedAPITransport() (http.RoundTripper, error) {
+	if !I_Acknowledge_This_API_Is_Experimental {
+		return nil, errors.New("use of AuthenticatedAPITransport without setting I_Acknowledge_This_API_Is_Experimental")
+	}
+	if err := s.Start(); err != nil {
+		return nil, err
+	}
+	return s.lb.KeyProvingNoiseRoundTripper(), nil
 }
 
 // Listen announces only on the Tailscale network.
@@ -1050,13 +1100,33 @@ type FunnelOption interface {
 	funnelOption()
 }
 
-type funnelOnly int
+type funnelOnly struct{}
 
 func (funnelOnly) funnelOption() {}
 
 // FunnelOnly configures the listener to only respond to connections from Tailscale Funnel.
 // The local tailnet will not be able to connect to the listener.
-func FunnelOnly() FunnelOption { return funnelOnly(1) }
+func FunnelOnly() FunnelOption { return funnelOnly{} }
+
+type funnelTLSConfig struct{ conf *tls.Config }
+
+func (f funnelTLSConfig) funnelOption() {}
+
+// FunnelTLSConfig configures the TLS configuration for [Server.ListenFunnel]
+//
+// This is rarely needed but can permit requiring client certificates, specific
+// ciphers suites, etc.
+//
+// The provided conf should at least be able to get a certificate, setting
+// GetCertificate, Certificates or GetConfigForClient appropriately.
+// The most common configuration is to set GetCertificate to
+// Server.LocalClient's GetCertificate method.
+//
+// Unless [FunnelOnly] is also used, the configuration is also used for
+// in-tailnet connections that don't arrive over Funnel.
+func FunnelTLSConfig(conf *tls.Config) FunnelOption {
+	return funnelTLSConfig{conf: conf}
+}
 
 // ListenFunnel announces on the public internet using Tailscale Funnel.
 //
@@ -1087,6 +1157,26 @@ func (s *Server) ListenFunnel(network, addr string, opts ...FunnelOption) (net.L
 	port, err := strconv.ParseUint(portStr, 10, 16)
 	if err != nil {
 		return nil, err
+	}
+
+	// Process, validate opts.
+	lnOn := listenOnBoth
+	var tlsConfig *tls.Config
+	for _, opt := range opts {
+		switch v := opt.(type) {
+		case funnelTLSConfig:
+			if v.conf == nil {
+				return nil, errors.New("invalid nil FunnelTLSConfig")
+			}
+			tlsConfig = v.conf
+		case funnelOnly:
+			lnOn = listenOnFunnel
+		default:
+			return nil, fmt.Errorf("unknown opts FunnelOption type %T", v)
+		}
+	}
+	if tlsConfig == nil {
+		tlsConfig = &tls.Config{GetCertificate: s.getCert}
 	}
 
 	ctx := context.Background()
@@ -1126,19 +1216,11 @@ func (s *Server) ListenFunnel(network, addr string, opts ...FunnelOption) (net.L
 	}
 
 	// Start a funnel listener.
-	lnOn := listenOnBoth
-	for _, opt := range opts {
-		if _, ok := opt.(funnelOnly); ok {
-			lnOn = listenOnFunnel
-		}
-	}
 	ln, err := s.listen(network, addr, lnOn)
 	if err != nil {
 		return nil, err
 	}
-	return tls.NewListener(ln, &tls.Config{
-		GetCertificate: s.getCert,
-	}), nil
+	return tls.NewListener(ln, tlsConfig), nil
 }
 
 type listenOn string

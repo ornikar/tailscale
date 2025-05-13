@@ -73,7 +73,7 @@ func pgStatefulSet(pg *tsapi.ProxyGroup, namespace, image, tsFirewallMode string
 				Name: fmt.Sprintf("tailscaledconfig-%d", i),
 				VolumeSource: corev1.VolumeSource{
 					Secret: &corev1.SecretVolumeSource{
-						SecretName: fmt.Sprintf("%s-%d-config", pg.Name, i),
+						SecretName: pgConfigSecretName(pg.Name, i),
 					},
 				},
 			})
@@ -178,7 +178,15 @@ func pgStatefulSet(pg *tsapi.ProxyGroup, namespace, image, tsFirewallMode string
 				corev1.EnvVar{
 					Name:  "TS_SERVE_CONFIG",
 					Value: fmt.Sprintf("/etc/proxies/%s", serveConfigKey),
-				})
+				},
+				corev1.EnvVar{
+					// Run proxies in cert share mode to
+					// ensure that only one TLS cert is
+					// issued for an HA Ingress.
+					Name:  "TS_EXPERIMENTAL_CERT_SHARE",
+					Value: "true",
+				},
+			)
 		}
 		return append(c.Env, envs...)
 	}()
@@ -189,6 +197,16 @@ func pgStatefulSet(pg *tsapi.ProxyGroup, namespace, image, tsFirewallMode string
 	// This mechanism currently (2025-01-26) rely on the local health check being accessible on the Pod's
 	// IP, so they are not supported for ProxyGroups where users have configured TS_LOCAL_ADDR_PORT to a custom
 	// value.
+	//
+	// NB: For _Ingress_ ProxyGroups, we run shutdown logic within containerboot
+	// in reaction to a SIGTERM signal instead of using a pre-stop hook. This is
+	// because Ingress pods need to unadvertise services, and it's preferable to
+	// avoid triggering those side-effects from a GET request that would be
+	// accessible to the whole cluster network (in the absence of NetworkPolicy
+	// rules).
+	//
+	// TODO(tomhjp): add a readiness probe or gate to Ingress Pods. There is a
+	// small window where the Pod is marked ready but routing can still fail.
 	if pg.Spec.Type == tsapi.ProxyGroupTypeEgress && !hasLocalAddrPortSet(proxyClass) {
 		c.Lifecycle = &corev1.Lifecycle{
 			PreStop: &corev1.LifecycleHandler{
@@ -229,6 +247,13 @@ func pgRole(pg *tsapi.ProxyGroup, namespace string) *rbacv1.Role {
 				APIGroups: []string{""},
 				Resources: []string{"secrets"},
 				Verbs: []string{
+					"list",
+				},
+			},
+			{
+				APIGroups: []string{""},
+				Resources: []string{"secrets"},
+				Verbs: []string{
 					"get",
 					"patch",
 					"update",
@@ -236,8 +261,8 @@ func pgRole(pg *tsapi.ProxyGroup, namespace string) *rbacv1.Role {
 				ResourceNames: func() (secrets []string) {
 					for i := range pgReplicas(pg) {
 						secrets = append(secrets,
-							fmt.Sprintf("%s-%d-config", pg.Name, i), // Config with auth key.
-							fmt.Sprintf("%s-%d", pg.Name, i),        // State.
+							pgConfigSecretName(pg.Name, i),   // Config with auth key.
+							fmt.Sprintf("%s-%d", pg.Name, i), // State.
 						)
 					}
 					return secrets
@@ -318,9 +343,9 @@ func pgIngressCM(pg *tsapi.ProxyGroup, namespace string) *corev1.ConfigMap {
 	}
 }
 
-func pgSecretLabels(pgName, typ string) map[string]string {
+func pgSecretLabels(pgName, secretType string) map[string]string {
 	return pgLabels(pgName, map[string]string{
-		labelSecretType: typ, // "config" or "state".
+		kubetypes.LabelSecretType: secretType, // "config" or "state".
 	})
 }
 
@@ -330,7 +355,7 @@ func pgLabels(pgName string, customLabels map[string]string) map[string]string {
 		l[k] = v
 	}
 
-	l[LabelManaged] = "true"
+	l[kubetypes.LabelManaged] = "true"
 	l[LabelParentType] = "proxygroup"
 	l[LabelParentName] = pgName
 
@@ -347,6 +372,10 @@ func pgReplicas(pg *tsapi.ProxyGroup) int32 {
 	}
 
 	return 2
+}
+
+func pgConfigSecretName(pgName string, i int32) string {
+	return fmt.Sprintf("%s-%d-config", pgName, i)
 }
 
 func pgEgressCMName(pg string) string {

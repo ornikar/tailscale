@@ -9,12 +9,16 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"os"
 	"sort"
 	"time"
 
 	"tailscale.com/prober"
 	"tailscale.com/tsweb"
 	"tailscale.com/version"
+
+	// Support for prometheus varz in tsweb
+	_ "tailscale.com/tsweb/promvarz"
 )
 
 var (
@@ -71,6 +75,9 @@ func main() {
 		}
 		for _, s := range st.bad {
 			log.Printf("bad: %s", s)
+		}
+		if len(st.bad) > 0 {
+			os.Exit(1)
 		}
 		return
 	}

@@ -359,7 +359,7 @@ func (sw *sessionWatcher) Start() error {
 	sw.doneCh = make(chan error, 1)
 
 	startedCh := make(chan error, 1)
-	go sw.run(startedCh)
+	go sw.run(startedCh, sw.doneCh)
 	if err := <-startedCh; err != nil {
 		return err
 	}
@@ -372,11 +372,11 @@ func (sw *sessionWatcher) Start() error {
 	return nil
 }
 
-func (sw *sessionWatcher) run(started chan<- error) {
+func (sw *sessionWatcher) run(started, done chan<- error) {
 	runtime.LockOSThread()
 	defer func() {
 		runtime.UnlockOSThread()
-		close(sw.doneCh)
+		close(done)
 	}()
 	err := sw.createMessageWindow()
 	started <- err
@@ -669,4 +669,39 @@ func (cs _WTS_CONNECTSTATE_CLASS) ToSessionStatus() SessionStatus {
 		// The session does not exist as far as we're concerned.
 		return ClosedSession
 	}
+}
+
+var (
+	procGetWindowLongPtrW *windows.LazyProc
+	procSetWindowLongPtrW *windows.LazyProc
+)
+
+func init() {
+	// GetWindowLongPtrW and SetWindowLongPtrW are only available on 64-bit platforms.
+	// https://web.archive.org/web/20250414195520/https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-getwindowlongptrw
+	if runtime.GOARCH == "386" || runtime.GOARCH == "arm" {
+		procGetWindowLongPtrW = moduser32.NewProc("GetWindowLongW")
+		procSetWindowLongPtrW = moduser32.NewProc("SetWindowLongW")
+	} else {
+		procGetWindowLongPtrW = moduser32.NewProc("GetWindowLongPtrW")
+		procSetWindowLongPtrW = moduser32.NewProc("SetWindowLongPtrW")
+	}
+}
+
+func getWindowLongPtr(hwnd windows.HWND, index int32) (res uintptr, err error) {
+	r0, _, e1 := syscall.Syscall(procGetWindowLongPtrW.Addr(), 2, uintptr(hwnd), uintptr(index), 0)
+	res = uintptr(r0)
+	if res == 0 && e1 != 0 {
+		err = errnoErr(e1)
+	}
+	return
+}
+
+func setWindowLongPtr(hwnd windows.HWND, index int32, newLong uintptr) (res uintptr, err error) {
+	r0, _, e1 := syscall.Syscall(procSetWindowLongPtrW.Addr(), 3, uintptr(hwnd), uintptr(index), uintptr(newLong))
+	res = uintptr(r0)
+	if res == 0 && e1 != 0 {
+		err = errnoErr(e1)
+	}
+	return
 }

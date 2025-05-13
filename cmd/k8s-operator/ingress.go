@@ -73,6 +73,7 @@ func (a *IngressReconciler) Reconcile(ctx context.Context, req reconcile.Request
 		return reconcile.Result{}, fmt.Errorf("failed to get ing: %w", err)
 	}
 	if !ing.DeletionTimestamp.IsZero() || !a.shouldExpose(ing) {
+		// TODO(irbekrm): this message is confusing if the Ingress is an HA Ingress
 		logger.Debugf("ingress is being deleted or should not be exposed, cleaning up")
 		return reconcile.Result{}, a.maybeCleanup(ctx, logger, ing)
 	}
@@ -291,9 +292,15 @@ func validateIngressClass(ctx context.Context, cl client.Client) error {
 
 func handlersForIngress(ctx context.Context, ing *networkingv1.Ingress, cl client.Client, rec record.EventRecorder, tlsHost string, logger *zap.SugaredLogger) (handlers map[string]*ipn.HTTPHandler, err error) {
 	addIngressBackend := func(b *networkingv1.IngressBackend, path string) {
+		if path == "" {
+			path = "/"
+			rec.Eventf(ing, corev1.EventTypeNormal, "PathUndefined", "configured backend is missing a path, defaulting to '/'")
+		}
+
 		if b == nil {
 			return
 		}
+
 		if b.Service == nil {
 			rec.Eventf(ing, corev1.EventTypeWarning, "InvalidIngressBackend", "backend for path %q is missing service", path)
 			return
